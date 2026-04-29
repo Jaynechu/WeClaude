@@ -22,7 +22,9 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from ilink_client import ILinkClient
 from memory_store import MemoryStore
@@ -40,10 +42,35 @@ SESSION_FILE = CONFIG_DIR / "sessions.json"
 MEDIA_DIR = CONFIG_DIR / "media"
 PERSONA_FILE = CONFIG_DIR / "persona.json"
 
+MAX_LEN = 200
+TZ = os.environ.get("WECLAUDE_TZ", "Australia/Melbourne")
+BUDDY_LABEL = os.environ.get("WECLAUDE_BUDDY_LABEL", "铁锅")
+
+_buddy_rule = (
+    f'\n- {BUDDY_LABEL} buddy 注释（<!-- buddy: --> ）微信端独立成"{BUDDY_LABEL}：xxx"气泡，1-25 字，无 *动作*'
+    if BUDDY_LABEL else ""
+)
+WECHAT_PROMPT = (
+    "WeChat output rules:\n"
+    "- 多段用空行（\\n\\n）分隔，bridge 拆成气泡，每次1-8段随机不固定\n"
+    "- 每段以短句为主，复杂内容可长但每段 ≤ 200 字\n"
+    "- 不用 markdown 列表/标题/粗体/分隔线，纯文本"
+    + _buddy_rule + "\n"
+)
+
+
+def _now_string() -> str:
+    """Inject current time so Claude knows it without running `date`."""
+    return datetime.now(ZoneInfo(TZ)).strftime("%Y-%m-%d %a %H:%M")
+
 # Per-user state
 _sessions: dict[str, str] = {}  # user_id -> session_id
 _user_agent: dict[str, str] = {}  # user_id -> agent_key
 _sessions_lock = threading.Lock()
+# Snapshot of the last /sessions listing shown to each user, so that
+# /use <n> remains consistent even if session mtimes change in between.
+_last_listed: dict[str, list[dict]] = {}
+_last_listed_lock = threading.Lock()
 
 # Runtime mutable working directory
 _working_dir: str | None = None
@@ -55,6 +82,13 @@ _executor = ThreadPoolExecutor(max_workers=8)
 _memory = MemoryStore()
 _scheduler = Scheduler()
 _personas: dict[str, str] = {}  # user_id -> persona string
+
+# Input debounce: merge rapid messages into one call_agent
+DEBOUNCE_S = 5
+_msg_buffer: dict[str, list[dict]] = {}  # user_id -> [{text, images, ctx}, ...]
+_msg_timer: dict[str, "threading.Timer"] = {}
+_buffer_lock = threading.Lock()
+_inflight: set[str] = set()
 
 
 def _load_personas() -> None:
@@ -109,7 +143,7 @@ AGENTS: dict[str, dict] = {
 
 def _build_claude_cmd(message: str, session_id: str | None) -> list[str]:
     """Build Claude Code CLI command."""
-    cmd = ["claude", "-p", "--output-format", "json"]
+    cmd = ["claude", "-p", "--output-format", "json", "--permission-mode", "acceptEdits"]
     if session_id:
         cmd.extend(["--resume", session_id])
     return cmd
@@ -150,8 +184,27 @@ def _save_sessions() -> None:
 # ── Markdown → Plain Text ───────────────────────────────────────
 
 
+def extract_buddy(text: str) -> tuple[str, str | None]:
+    """Strip <!-- buddy: ... --> from main text, return (main, buddy_chunk)."""
+    buddy_chunk: str | None = None
+
+    def grab(m: "re.Match[str]") -> str:
+        nonlocal buddy_chunk
+        body = m.group(1).strip()
+        body = re.sub(r"\*[^*]+\*", "", body)
+        body = re.sub(r"\s+", " ", body).strip()
+        if body:
+            buddy_chunk = f"{BUDDY_LABEL}：{body}" if BUDDY_LABEL else body
+        return ""
+
+    main = re.sub(r"<!--\s*buddy:\s*(.+?)\s*-->", grab, text, flags=re.DOTALL)
+    return main.strip(), buddy_chunk
+
+
 def md_to_plain(text: str) -> str:
     """Convert markdown to WeChat-friendly plain text."""
+    # Strip any leftover HTML comments (buddy already extracted upstream).
+    text = re.sub(r"<!--.*?-->", "", text, flags=re.DOTALL)
     text = re.sub(r"```\w*\n?", "", text)
     text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
     text = re.sub(r"__(.+?)__", r"\1", text)
@@ -163,6 +216,32 @@ def md_to_plain(text: str) -> str:
     text = re.sub(r"^[-*_]{3,}\s*$", "--------", text, flags=re.MULTILINE)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
+
+
+def split_msg(text: str, max_len: int = MAX_LEN) -> list[str]:
+    """Split into bubbles: each \\n\\n is a bubble boundary; hard-cut on overflow."""
+    if not text:
+        return []
+    chunks: list[str] = []
+    for para in re.split(r"\n{2,}", text):
+        para = para.strip()
+        if not para:
+            continue
+        if len(para) <= max_len:
+            chunks.append(para)
+            continue
+        rest = para
+        while rest:
+            if len(rest) <= max_len:
+                chunks.append(rest)
+                break
+            line = rest.rfind("\n", 0, max_len)
+            at = line + 1 if line > 0 else max_len
+            piece = rest[:at].strip()
+            if piece:
+                chunks.append(piece)
+            rest = rest[at:].lstrip()
+    return chunks
 
 
 # ── Continuous Typing Indicator ─────────────────────────────────
@@ -193,6 +272,21 @@ def _parse_claude_output(stdout: str, user_id: str) -> str:
 
     try:
         data = json.loads(stdout)
+
+        # Current Claude Code CLI emits a JSON array of event objects.
+        # The final {"type":"result", ...} entry carries the text and session_id.
+        if isinstance(data, list):
+            for obj in reversed(data):
+                if isinstance(obj, dict) and obj.get("type") == "result":
+                    sid = obj.get("session_id")
+                    if sid:
+                        with _sessions_lock:
+                            _sessions[user_id] = sid
+                        _save_sessions()
+                    result_text = obj.get("result", "")
+                    return result_text if result_text else "[Empty response]"
+            return "[No result event in Claude output]"
+
         session_id = data.get("session_id")
         if session_id:
             with _sessions_lock:
@@ -249,7 +343,7 @@ def call_agent(
         session_id = _sessions.get(user_id) if agent_key == "claude" else None
 
     if agent_key == "claude":
-        logger.info("Claude session: %s", session_id[:12] if session_id else "new")
+        logger.debug("Claude session: %s", session_id[:12] if session_id else "new")
 
     # Append image instructions for Claude to read the files
     if image_paths:
@@ -265,17 +359,16 @@ def call_agent(
     # Replace binary name with full path
     cmd[0] = binary
 
-    # Build system prompt with memory + persona
+    # Build system prompt with memory + persona + wechat channel
     if agent_key == "claude":
-        sys_parts = []
+        sys_parts = [f"Current time: {_now_string()} ({TZ})", WECHAT_PROMPT]
         persona = _personas.get(user_id, "")
         if persona:
             sys_parts.append(f"Persona: {persona}")
         mem_ctx = _memory.get_context()
         if mem_ctx:
             sys_parts.append(mem_ctx)
-        if sys_parts:
-            cmd.extend(["--append-system-prompt", "\n".join(sys_parts)])
+        cmd.extend(["--append-system-prompt", "\n\n".join(sys_parts)])
 
     # Pass user message via stdin (clean, no context mixing)
     stdin_data = None
@@ -307,15 +400,14 @@ def call_agent(
                 retry_cmd = _build_claude_cmd(message, None)
                 retry_cmd[0] = binary
                 # Re-add system prompt context
-                sys_parts = []
+                sys_parts = [f"Current time: {_now_string()} ({TZ})", WECHAT_PROMPT]
                 persona = _personas.get(user_id, "")
                 if persona:
                     sys_parts.append(f"Persona: {persona}")
                 mem_ctx = _memory.get_context()
                 if mem_ctx:
                     sys_parts.append(mem_ctx)
-                if sys_parts:
-                    retry_cmd.extend(["--append-system-prompt", "\n".join(sys_parts)])
+                retry_cmd.extend(["--append-system-prompt", "\n\n".join(sys_parts)])
                 result = subprocess.run(
                     retry_cmd,
                     input=stdin_data,
@@ -334,7 +426,7 @@ def call_agent(
         return agent["parse_output"](result.stdout, user_id)
 
     except subprocess.TimeoutExpired:
-        return f"[{agent['name']} timed out after 5 minutes]"
+        return f"[{agent['name']} timed out after 30 minutes]"
     except FileNotFoundError:
         return f"[{agent['name']} CLI not found]"
 
@@ -380,75 +472,133 @@ def _handle_images(client: ILinkClient, message: dict) -> list[Path]:
 # ── Session Management ──────────────────────────────────────────
 
 
-def list_claude_sessions(working_dir: str | None = None) -> str:
-    """List recent Claude Code sessions."""
-    binary = _find_binary("claude")
-    if not binary:
-        return "[Claude Code CLI not found]"
-    try:
-        result = subprocess.run(
-            [binary, "sessions", "list", "--output-format", "json"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            cwd=working_dir,
+def _scan_project_sessions(working_dir: str | None = None) -> list[dict]:
+    """Scan ~/.claude/projects/<escaped-cwd>/*.jsonl for Claude Code sessions.
+
+    Current Claude Code CLI stores each session as <session_id>.jsonl under a
+    project folder derived from the cwd (slashes replaced with dashes).
+    """
+    cwd = Path(working_dir).resolve() if working_dir else Path.cwd()
+    escaped = str(cwd).replace("/", "-")
+    proj_dir = Path.home() / ".claude" / "projects" / escaped
+    if not proj_dir.is_dir():
+        return []
+
+    out: list[dict] = []
+    for jf in proj_dir.glob("*.jsonl"):
+        try:
+            mtime = jf.stat().st_mtime
+        except OSError:
+            continue
+        summary = ""
+        try:
+            with jf.open() as f:
+                for _ in range(30):
+                    line = f.readline()
+                    if not line:
+                        break
+                    try:
+                        d = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if d.get("type") == "summary" and d.get("summary"):
+                        summary = d["summary"]
+                        break
+                    if d.get("type") == "user":
+                        msg = d.get("message") or {}
+                        content = msg.get("content")
+                        if isinstance(content, str):
+                            summary = content
+                            break
+                        if isinstance(content, list):
+                            for block in content:
+                                if isinstance(block, dict) and block.get("type") == "text":
+                                    summary = block.get("text", "")
+                                    break
+                            if summary:
+                                break
+        except OSError:
+            pass
+        out.append(
+            {
+                "id": jf.stem,
+                "session_id": jf.stem,
+                "summary": (summary or "").strip().replace("\n", " ") or "[no summary]",
+                "updated_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(mtime)),
+                "_mtime": mtime,
+            }
         )
-        if result.returncode != 0:
-            return "[Failed to list sessions]"
+    out.sort(key=lambda s: s["_mtime"], reverse=True)
+    return out
 
-        sessions = json.loads(result.stdout) if result.stdout.strip() else []
-        if not sessions:
-            return "No active sessions."
 
-        lines = ["Recent Claude Code Sessions:\n"]
-        for i, s in enumerate(sessions[:10], 1):
-            sid = s.get("id", s.get("session_id", "?"))
-            summary = s.get("summary", s.get("name", ""))[:40]
-            ts = s.get("updated_at", s.get("timestamp", ""))[:19]
-            lines.append(f"  {i}. [{sid[:8]}] {summary} ({ts})")
-        lines.append("\nUse /use <number> to switch session")
-        return "\n".join(lines)
-    except (subprocess.TimeoutExpired, FileNotFoundError, json.JSONDecodeError):
-        return "[Failed to list sessions]"
+def list_claude_sessions(working_dir: str | None = None, user_id: str | None = None) -> str:
+    """List recent Claude Code sessions by scanning project storage."""
+    sessions = _scan_project_sessions(working_dir)
+    if not sessions:
+        return "No active sessions."
+
+    shown = sessions[:10]
+    if user_id is not None:
+        with _last_listed_lock:
+            _last_listed[user_id] = shown
+
+    lines = ["Recent Claude Code Sessions:\n"]
+    for i, s in enumerate(shown, 1):
+        sid = s["id"]
+        summary = s["summary"][:40]
+        ts = s["updated_at"]
+        lines.append(f"  {i}. [{sid[:8]}] {summary} ({ts})")
+    lines.append("\nUse /use <number> to switch session")
+    return "\n".join(lines)
 
 
 def pick_session(choice: str, user_id: str, working_dir: str | None = None) -> str:
-    """Switch to a session by number or ID."""
-    binary = _find_binary("claude")
-    if not binary:
-        return "[Claude Code CLI not found]"
-    try:
-        result = subprocess.run(
-            [binary, "sessions", "list", "--output-format", "json"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            cwd=working_dir,
-        )
-        sessions = json.loads(result.stdout) if result.stdout.strip() else []
-    except Exception:
-        return "[Failed to list sessions]"
+    """Switch to a session by number or session-id prefix.
 
+    Numeric choices resolve against the last listing shown to this user
+    (via /ss), so the numbering stays consistent even if session
+    mtimes shift between listing and selection.
+    """
+    with _last_listed_lock:
+        cached = list(_last_listed.get(user_id, []))
+
+    # Numeric pick → prefer cached snapshot; fall back to fresh scan if absent.
+    try:
+        idx = int(choice) - 1
+    except ValueError:
+        idx = None
+
+    if idx is not None:
+        source = cached if cached else _scan_project_sessions(working_dir)
+        if not source:
+            return "No sessions available. Run /ss first."
+        if 0 <= idx < len(source):
+            target = source[idx]
+            session_id = target["id"]
+            summary = target["summary"][:40]
+            with _sessions_lock:
+                _sessions[user_id] = session_id
+            _save_sessions()
+            return f"Switched to session: [{session_id[:8]}] {summary}"
+        return f"Session '{choice}' not found. Use /ss to list."
+
+    # Prefix-by-id pick always uses a fresh scan (id-based, not positional).
+    sessions = _scan_project_sessions(working_dir)
     if not sessions:
         return "No sessions available."
 
     target = None
-    try:
-        idx = int(choice) - 1
-        if 0 <= idx < len(sessions):
-            target = sessions[idx]
-    except ValueError:
-        for s in sessions:
-            sid = s.get("id", s.get("session_id", ""))
-            if sid.startswith(choice):
-                target = s
-                break
+    for s in sessions:
+        if s["id"].startswith(choice):
+            target = s
+            break
 
     if not target:
-        return f"Session '{choice}' not found. Use /sessions to list."
+        return f"Session '{choice}' not found. Use /ss to list."
 
-    session_id = target.get("id", target.get("session_id", ""))
-    summary = target.get("summary", target.get("name", ""))[:40]
+    session_id = target["id"]
+    summary = target["summary"][:40]
     with _sessions_lock:
         _sessions[user_id] = session_id
     _save_sessions()
@@ -456,6 +606,103 @@ def pick_session(choice: str, user_id: str, working_dir: str | None = None) -> s
 
 
 # ── Message Handler ─────────────────────────────────────────────
+
+
+def _schedule_flush(client: ILinkClient, user_id: str, working_dir: str | None) -> None:
+    """Reset 5s debounce Timer for this user."""
+    with _buffer_lock:
+        old = _msg_timer.pop(user_id, None)
+        if old:
+            old.cancel()
+        timer = threading.Timer(
+            DEBOUNCE_S,
+            lambda: _flush(client, user_id, working_dir),
+        )
+        _msg_timer[user_id] = timer
+        timer.start()
+
+
+def _flush(client: ILinkClient, user_id: str, working_dir: str | None) -> None:
+    """Timer fired — merge buffered messages and call_agent once."""
+    with _buffer_lock:
+        if user_id in _inflight:
+            # Re-arm; current call_agent in flight, retry in 5s
+            timer = threading.Timer(
+                DEBOUNCE_S,
+                lambda: _flush(client, user_id, working_dir),
+            )
+            _msg_timer[user_id] = timer
+            timer.start()
+            return
+        items = _msg_buffer.pop(user_id, [])
+        _msg_timer.pop(user_id, None)
+        if not items:
+            return
+        _inflight.add(user_id)
+
+    try:
+        merged_text = "\n\n".join(i["text"] for i in items if i["text"]).strip()
+        merged_images: list[Path] = []
+        for i in items:
+            merged_images.extend(i["images"])
+        ctx_token = items[-1]["ctx"]
+
+        stop_typing = threading.Event()
+        typing_thread = threading.Thread(
+            target=_typing_loop,
+            args=(client, user_id, ctx_token, stop_typing),
+            daemon=True,
+        )
+        typing_thread.start()
+
+        try:
+            response = call_agent(
+                merged_text, user_id, working_dir, merged_images or None
+            )
+            main_text, buddy_chunk = extract_buddy(response)
+            main_text = md_to_plain(main_text)
+            chunks = split_msg(main_text)
+            if buddy_chunk:
+                chunks.append(buddy_chunk)
+        finally:
+            stop_typing.set()
+            typing_thread.join(timeout=1)
+
+        for chunk in chunks:
+            client.send_text(user_id, ctx_token, chunk)
+        logger.info(
+            "Replied to %s (%d msgs merged, %d bubbles, %d chars)",
+            user_id[:16],
+            len(items),
+            len(chunks),
+            len(response),
+        )
+
+        try:
+            _memory.log_conversation(merged_text[:200], response[:200])
+        except Exception:
+            pass
+
+    except Exception as e:
+        logger.error("flush error: %s", e, exc_info=True)
+        try:
+            client.send_text(user_id, items[-1]["ctx"], "[Internal error, please try again]")
+        except Exception:
+            pass
+    finally:
+        with _buffer_lock:
+            _inflight.discard(user_id)
+            # If new messages arrived during call_agent, re-arm Timer
+            if _msg_buffer.get(user_id):
+                old = _msg_timer.pop(user_id, None)
+                if old:
+                    old.cancel()
+                timer = threading.Timer(
+                    DEBOUNCE_S,
+                    lambda: _flush(client, user_id, working_dir),
+                )
+                _msg_timer[user_id] = timer
+                timer.start()
 
 
 def handle_message(
@@ -498,7 +745,7 @@ def handle_message(
                 [list(i.keys()) for i in raw_items],
             )
 
-        logger.info(
+        logger.debug(
             "Message from %s (%d chars, %d images)",
             from_user[:16],
             len(text),
@@ -506,6 +753,10 @@ def handle_message(
         )
 
         cmd = text.strip()
+        # Tolerate accidental whitespace right after the leading slash
+        # (iOS WeChat keyboards sometimes insert a space after "/").
+        if cmd.startswith("/"):
+            cmd = "/" + cmd[1:].lstrip()
         cmd_lower = cmd.lower()
 
         with _workdir_lock:
@@ -530,9 +781,9 @@ def handle_message(
             )
             return
 
-        if cmd_lower == "/sessions":
+        if cmd_lower == "/ss":
             client.send_text(
-                from_user, context_token, list_claude_sessions(working_dir)
+                from_user, context_token, list_claude_sessions(working_dir, from_user)
             )
             return
 
@@ -724,7 +975,7 @@ def handle_message(
                 from_user,
                 context_token,
                 "Session:\n"
-                "  /sessions /use <n> /new /reset\n"
+                "  /ss /use <n> /new /reset\n"
                 "Agent:\n"
                 "  /agent /agent <x> /workdir <p>\n"
                 "Memory:\n"
@@ -744,30 +995,14 @@ def handle_message(
             )
             return
 
-        # ── Forward to AI agent ──
-        stop_typing = threading.Event()
-        typing_thread = threading.Thread(
-            target=_typing_loop,
-            args=(client, from_user, context_token, stop_typing),
-            daemon=True,
-        )
-        typing_thread.start()
-
-        try:
-            response = call_agent(text, from_user, working_dir, image_paths)
-            response = md_to_plain(response)
-        finally:
-            stop_typing.set()
-            typing_thread.join(timeout=1)
-
-        client.send_text(from_user, context_token, response)
-        logger.info("Replied to %s (%d chars)", from_user[:16], len(response))
-
-        # Log conversation to daily memory
-        try:
-            _memory.log_conversation(text[:200], response[:200])
-        except Exception:
-            pass
+        # ── Forward to AI agent (debounced) ──
+        with _buffer_lock:
+            _msg_buffer.setdefault(from_user, []).append({
+                "text": text,
+                "images": list(image_paths),
+                "ctx": context_token,
+            })
+        _schedule_flush(client, from_user, working_dir)
 
     except Exception as e:
         logger.error("handle_message error: %s", e, exc_info=True)
@@ -801,14 +1036,22 @@ def run_bridge(working_dir: str | None = None) -> None:
         try:
             if run_claude:
                 response = call_agent(message, user_id, _working_dir, None)
-                response = md_to_plain(response)
-                text = f"[Scheduled] {response}"
+                main_text, buddy_chunk = extract_buddy(response)
+                main_text = md_to_plain(main_text)
+                chunks = split_msg(main_text)
+                if not chunks:
+                    chunks = ["[Empty response]"]
+                chunks[0] = f"[Scheduled] {chunks[0]}"
+                if buddy_chunk:
+                    chunks.append(buddy_chunk)
             else:
-                text = f"[Reminder] {message}"
-            if not client.send_text(user_id, "", text):
-                logger.warning(
-                    "Failed to deliver scheduled message to %s", user_id[:16]
-                )
+                chunks = [f"[Reminder] {message}"]
+            for chunk in chunks:
+                if not client.send_text(user_id, "", chunk):
+                    logger.warning(
+                        "Failed to deliver scheduled message to %s", user_id[:16]
+                    )
+                    break
         except Exception as e:
             logger.error("Scheduler callback error: %s", e)
 

@@ -257,18 +257,19 @@ class ILinkClient:
         all_msgs = data.get("msgs", [])
         if all_msgs:
             logger.info("Received %d raw messages", len(all_msgs))
+            debug_full = os.environ.get("WECLAUDE_DEBUG") == "1"
             for m in all_msgs:
                 for item in m.get("item_list", []):
                     it = item.get("type")
                     keys = [k for k in item.keys() if k != "type"]
-                    logger.info(
+                    logger.debug(
                         "  msg_type=%s item_type=%s keys=%s",
                         m.get("message_type"),
                         it,
                         keys,
                     )
-                    # Dump non-text items fully for debugging
-                    if it != 1:
+                    # Dump non-text items fully for debugging (gated by WECLAUDE_DEBUG=1)
+                    if debug_full and it != 1:
                         import copy
 
                         debug_item = copy.deepcopy(item)
@@ -350,23 +351,23 @@ class ILinkClient:
                 config_resp = self._client.post(
                     f"{self.base_url}/ilink/bot/getconfig",
                     headers=self._headers(),
-                    json={"to_user_id": to_user_id},
+                    json={
+                        "ilink_user_id": to_user_id,
+                        "context_token": context_token or "",
+                    },
                     timeout=5,
                 )
                 if config_resp.status_code == 200:
                     data = config_resp.json()
                     self._typing_ticket = data.get("typing_ticket", "")
-                    if not self._typing_ticket:
-                        # API doesn't support typing, stop trying
-                        self._typing_ticket = "__disabled__"
-            if self._typing_ticket and self._typing_ticket != "__disabled__":
+            if self._typing_ticket:
                 self._client.post(
                     f"{self.base_url}/ilink/bot/sendtyping",
                     headers=self._headers(),
                     json={
-                        "to_user_id": to_user_id,
-                        "context_token": context_token,
+                        "ilink_user_id": to_user_id,
                         "typing_ticket": self._typing_ticket,
+                        "status": 1,
                     },
                     timeout=5,
                 )
@@ -483,7 +484,7 @@ class ILinkClient:
                     f"https://novac2c.cdn.weixin.qq.com/c2c/download?fileid={cdn_url}"
                 )
 
-            logger.info("Downloading media from: %s...", download_url[:80])
+            logger.debug("Downloading media from: %s...", download_url[:80])
             resp = self._client.get(download_url, timeout=30)
             resp.raise_for_status()
 
