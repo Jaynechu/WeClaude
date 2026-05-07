@@ -63,6 +63,25 @@ def _now_string() -> str:
     """Inject current time so Claude knows it without running `date`."""
     return datetime.now(ZoneInfo(TZ)).strftime("%Y-%m-%d %a %H:%M")
 
+
+def _time_since_last_reply(session_id: str | None, working_dir: str | None) -> tuple[float, str] | None:
+    """Return (gap_seconds, human_string) since the last assistant turn (jsonl mtime)."""
+    if not session_id:
+        return None
+    cwd = Path(working_dir).resolve() if working_dir else Path.cwd()
+    jsonl = Path.home() / ".claude" / "projects" / str(cwd).replace("/", "-") / f"{session_id}.jsonl"
+    if not jsonl.is_file():
+        return None
+    gap_s = time.time() - jsonl.stat().st_mtime
+    if gap_s < 60:
+        return gap_s, f"{int(gap_s)}s"
+    if gap_s < 3600:
+        return gap_s, f"{int(gap_s / 60)}m"
+    h = gap_s / 3600
+    if h >= 24:
+        return gap_s, f"{int(h // 24)}d {int(h % 24)}h"
+    return gap_s, f"{h:.1f}h"
+
 # Per-user state
 _sessions: dict[str, str] = {}  # user_id -> session_id
 _user_agent: dict[str, str] = {}  # user_id -> agent_key
@@ -143,7 +162,8 @@ AGENTS: dict[str, dict] = {
 
 def _build_claude_cmd(message: str, session_id: str | None) -> list[str]:
     """Build Claude Code CLI command."""
-    cmd = ["claude", "-p", "--output-format", "json", "--permission-mode", "acceptEdits"]
+    cmd = ["claude", "-p", "--output-format", "json", "--permission-mode", "acceptEdits",
+           "--allowedTools", "mcp__claude-buddy"]
     if session_id:
         cmd.extend(["--resume", session_id])
     return cmd
@@ -265,6 +285,50 @@ def _typing_loop(
 # ── Claude Code Output Parsing ──────────────────────────────────
 
 
+def _extract_recent_buddy_reacts(session_id: str, working_dir: str | None) -> list[str]:
+    """Scan jsonl tail for buddy_react calls in current turn (until last user msg).
+
+    Returns input.comment list with markdown asterisks stripped (content kept).
+    """
+    cwd = Path(working_dir).resolve() if working_dir else Path.cwd()
+    jsonl = Path.home() / ".claude" / "projects" / str(cwd).replace("/", "-") / f"{session_id}.jsonl"
+    if not jsonl.is_file():
+        return []
+    try:
+        lines = jsonl.read_text().splitlines()
+    except OSError:
+        return []
+    reacts: list[str] = []
+    for line in reversed(lines):
+        try:
+            d = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        msg = d.get("message", {})
+        if not isinstance(msg, dict):
+            continue
+        # Stop at the user message that started this turn.
+        if msg.get("role") == "user" and not isinstance(msg.get("content"), list):
+            break
+        if msg.get("role") == "user" and isinstance(msg.get("content"), list):
+            # tool_result entries also have role=user; skip them, only stop on real user text.
+            if any(isinstance(b, dict) and b.get("type") != "tool_result" for b in msg["content"]):
+                break
+        content = msg.get("content", [])
+        if not isinstance(content, list):
+            continue
+        for blk in content:
+            if not isinstance(blk, dict):
+                continue
+            if blk.get("type") == "tool_use" and blk.get("name") == "mcp__claude-buddy__buddy_react":
+                comment = (blk.get("input") or {}).get("comment", "").strip()
+                if comment:
+                    comment = re.sub(r"\*([^*]+)\*", r"\1", comment)
+                    reacts.append(comment)
+    reacts.reverse()
+    return reacts
+
+
 def _parse_claude_output(stdout: str, user_id: str) -> str:
     """Parse Claude CLI JSON output, extract text and session_id."""
     if not stdout.strip():
@@ -328,16 +392,16 @@ def call_agent(
     user_id: str,
     working_dir: str | None = None,
     image_paths: list[Path] | None = None,
-) -> str:
-    """Call the user's selected AI agent CLI and return the response."""
+) -> tuple[str, list[str]]:
+    """Call the user's selected AI agent CLI; return (response_text, buddy_reacts)."""
     agent_key = _get_user_agent(user_id)
     agent = AGENTS.get(agent_key)
     if not agent:
-        return f"[Unknown agent: {agent_key}]"
+        return f"[Unknown agent: {agent_key}]", []
 
     binary = _find_binary(agent["binary"])
     if not binary:
-        return f"[{agent['name']} not found. Install it first.]"
+        return f"[{agent['name']} not found. Install it first.]", []
 
     with _sessions_lock:
         session_id = _sessions.get(user_id) if agent_key == "claude" else None
@@ -345,13 +409,14 @@ def call_agent(
     if agent_key == "claude":
         logger.debug("Claude session: %s", session_id[:12] if session_id else "new")
 
-    # Append image instructions for Claude to read the files
+    # Append attachment instructions for Claude to read the files
     if image_paths:
         paths_str = ", ".join(str(p) for p in image_paths)
         img_note = (
-            f"\n\nThe user sent {len(image_paths)} image(s). "
+            f"\n\nThe user sent {len(image_paths)} attachment(s) "
+            f"(image, PDF, or other file). "
             f"Use the Read tool to view: {paths_str}\n"
-            f"Describe what you see and respond to the user's message."
+            f"Then respond to the user's message."
         )
         message += img_note
 
@@ -360,8 +425,18 @@ def call_agent(
     cmd[0] = binary
 
     # Build system prompt with memory + persona + wechat channel
+    gap_info = _time_since_last_reply(session_id, working_dir) if agent_key == "claude" else None
     if agent_key == "claude":
         sys_parts = [f"Current time: {_now_string()} ({TZ})", WECHAT_PROMPT]
+        if gap_info:
+            gap_s, gap_str = gap_info
+            note = f"Time since last reply: {gap_str}."
+            if gap_s >= 3600:
+                note += (
+                    " Lumi has likely slept/been away — don't replay the previous "
+                    "chat's tone, read her current message at face value."
+                )
+            sys_parts.append(note)
         persona = _personas.get(user_id, "")
         if persona:
             sys_parts.append(f"Persona: {persona}")
@@ -370,10 +445,19 @@ def call_agent(
             sys_parts.append(mem_ctx)
         cmd.extend(["--append-system-prompt", "\n\n".join(sys_parts)])
 
-    # Pass user message via stdin (clean, no context mixing)
+    # Pass user message via stdin (clean, no context mixing).
+    # For Claude: prepend a high-salience time marker so it can't be lost in
+    # 50K tokens of conversation context (system-prompt injection alone fails
+    # to override prior emotional anchor when gap is small).
     stdin_data = None
     if agent["use_stdin"]:
-        stdin_data = message
+        if agent_key == "claude":
+            gap_str = gap_info[1] if gap_info else "first turn"
+            stdin_data = f"[time: {_now_string()} | gap: {gap_str}]\n\n{message}"
+        else:
+            stdin_data = message
+
+    sub_env = {**os.environ, "WECLAUDE_BRIDGE": "1"}
 
     try:
         result = subprocess.run(
@@ -383,6 +467,7 @@ def call_agent(
             text=True,
             timeout=1800,
             cwd=working_dir,
+            env=sub_env,
         )
 
         if result.returncode != 0:
@@ -415,20 +500,28 @@ def call_agent(
                     text=True,
                     timeout=1800,
                     cwd=working_dir,
+                    env=sub_env,
                 )
 
             if result.returncode != 0:
                 logger.error("%s error (exit %d)", agent["name"], result.returncode)
                 if stderr:
                     logger.error("%s stderr: %s", agent["name"], stderr[:500])
-                return f"[{agent['name']} error. Check bridge logs for details.]"
+                return f"[{agent['name']} error. Check bridge logs for details.]", []
 
-        return agent["parse_output"](result.stdout, user_id)
+        response_text = agent["parse_output"](result.stdout, user_id)
+        reacts: list[str] = []
+        if agent_key == "claude":
+            with _sessions_lock:
+                sid = _sessions.get(user_id)
+            if sid:
+                reacts = _extract_recent_buddy_reacts(sid, working_dir)
+        return response_text, reacts
 
     except subprocess.TimeoutExpired:
-        return f"[{agent['name']} timed out after 30 minutes]"
+        return f"[{agent['name']} timed out after 30 minutes]", []
     except FileNotFoundError:
-        return f"[{agent['name']} CLI not found]"
+        return f"[{agent['name']} CLI not found]", []
 
 
 # ── Image Handling ──────────────────────────────────────────────
@@ -445,7 +538,8 @@ def _handle_images(client: ILinkClient, message: dict) -> list[Path]:
             item.get("cdn_url") or item.get("encrypt_query_param")
         ):
             ext = ".jpg"
-            path = MEDIA_DIR / f"img_{uuid.uuid4().hex[:12]}{ext}"
+            ts = time.strftime("%Y-%m-%d_%H%M%S")
+            path = MEDIA_DIR / f"{ts}_{uuid.uuid4().hex[:6]}{ext}"
             if client.download_media(
                 item.get("cdn_url", ""),
                 item.get("aes_key", ""),
@@ -456,13 +550,20 @@ def _handle_images(client: ILinkClient, message: dict) -> list[Path]:
                 logger.info(
                     "Downloaded image: %s (%d bytes)", path.name, path.stat().st_size
                 )
-        elif item["type"] == "file" and item.get("cdn_url"):
+        elif item["type"] == "file" and (
+            item.get("cdn_url") or item.get("encrypt_query_param")
+        ):
             raw_name = item.get("filename", f"file_{int(time.time())}")
             safe_name = Path(raw_name).name  # strip path components
             if not safe_name or safe_name.startswith("."):
                 safe_name = f"file_{int(time.time() * 1000)}"
             path = MEDIA_DIR / safe_name
-            if client.download_media(item["cdn_url"], item.get("aes_key", ""), path):
+            if client.download_media(
+                item.get("cdn_url", ""),
+                item.get("aes_key", ""),
+                path,
+                encrypt_query_param=item.get("encrypt_query_param", ""),
+            ):
                 saved.append(path)
                 logger.info("Downloaded file: %s", path.name)
 
@@ -656,12 +757,14 @@ def _flush(client: ILinkClient, user_id: str, working_dir: str | None) -> None:
         typing_thread.start()
 
         try:
-            response = call_agent(
+            response, reacts = call_agent(
                 merged_text, user_id, working_dir, merged_images or None
             )
             main_text, buddy_chunk = extract_buddy(response)
             main_text = md_to_plain(main_text)
             chunks = split_msg(main_text)
+            for r in reacts:
+                chunks.append(f"{BUDDY_LABEL}：{r}" if BUDDY_LABEL else r)
             if buddy_chunk:
                 chunks.append(buddy_chunk)
         finally:
@@ -714,6 +817,14 @@ def handle_message(
     from_user = msg.get("from_user_id", "unknown")
     context_token = msg.get("context_token", "")
 
+    with _workdir_lock:
+        working_dir = _working_dir
+
+    # Pre-emptive debounce reset: a sibling message arriving 1s later
+    # would otherwise have its slow image download outrun the prior
+    # message's timer and split into two replies.
+    _schedule_flush(client, from_user, working_dir)
+
     try:
         text = client.extract_text(msg) or ""
 
@@ -758,9 +869,6 @@ def handle_message(
         if cmd.startswith("/"):
             cmd = "/" + cmd[1:].lstrip()
         cmd_lower = cmd.lower()
-
-        with _workdir_lock:
-            working_dir = _working_dir
 
         # ── Special commands ──
         if cmd_lower in ("/reset", "/clear"):
@@ -1035,13 +1143,15 @@ def run_bridge(working_dir: str | None = None) -> None:
     def _on_job_fire(user_id: str, message: str, run_claude: bool) -> None:
         try:
             if run_claude:
-                response = call_agent(message, user_id, _working_dir, None)
+                response, reacts = call_agent(message, user_id, _working_dir, None)
                 main_text, buddy_chunk = extract_buddy(response)
                 main_text = md_to_plain(main_text)
                 chunks = split_msg(main_text)
                 if not chunks:
                     chunks = ["[Empty response]"]
                 chunks[0] = f"[Scheduled] {chunks[0]}"
+                for r in reacts:
+                    chunks.append(f"{BUDDY_LABEL}：{r}" if BUDDY_LABEL else r)
                 if buddy_chunk:
                     chunks.append(buddy_chunk)
             else:

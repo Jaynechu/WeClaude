@@ -443,11 +443,20 @@ class ILinkClient:
                 )
             elif item_type == 4:  # File
                 file_item = item.get("file_item", {})
+                file_media = file_item.get("media", {})
+                cdn_url = file_media.get("full_url", "") or file_item.get(
+                    "cdn_url", ""
+                )
+                aes_key = file_media.get("aes_key", "") or file_item.get(
+                    "aes_key", ""
+                )
+                encrypt_param = file_media.get("encrypt_query_param", "")
                 media.append(
                     {
                         "type": "file",
-                        "cdn_url": file_item.get("cdn_url", ""),
-                        "aes_key": file_item.get("aes_key", ""),
+                        "cdn_url": cdn_url,
+                        "aes_key": aes_key,
+                        "encrypt_query_param": encrypt_param,
                         "filename": file_item.get("file_name", "unknown"),
                     }
                 )
